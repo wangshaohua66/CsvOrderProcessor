@@ -30,10 +30,21 @@ from contextlib import contextmanager
 import logging
 import threading
 
-# Configure logging
+from logging.handlers import RotatingFileHandler
+
+# Configure logging with rotation to prevent disk space issues
+log_handler = RotatingFileHandler(
+    'order_processor.log',
+    maxBytes=10*1024*1024,  # 10MB per file
+    backupCount=5,          # Keep up to 5 backup files
+    encoding='utf-8'
+)
+console_handler = logging.StreamHandler()
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[log_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
 
@@ -65,15 +76,15 @@ class InventoryError(OrderProcessingError):
 class CurrencyConverter:
     """Thread-safe currency conversion with cached rates."""
 
-    # Exchange rates relative to USD (would be fetched from API in production)
+    # Exchange rates relative to USD - use Decimal from the start for precision
     EXCHANGE_RATES = {
-        'USD': 1.0,
-        'EUR': 0.92,
-        'GBP': 0.79,
-        'CNY': 7.24,
-        'JPY': 150.25,
-        'CAD': 1.36,
-        'AUD': 1.53,
+        'USD': Decimal('1.0'),
+        'EUR': Decimal('0.92'),
+        'GBP': Decimal('0.79'),
+        'CNY': Decimal('7.24'),
+        'JPY': Decimal('150.25'),
+        'CAD': Decimal('1.36'),
+        'AUD': Decimal('1.53'),
     }
 
     _instance_lock = threading.Lock()
@@ -91,14 +102,14 @@ class CurrencyConverter:
         if self._initialized:
             return
         self._initialized = True
-        self._cache = {}
+        self._cache = {}  # Stores Decimal rates, not float
         self._cache_lock = threading.Lock()
 
     def convert(self, amount: Decimal, from_currency: str,
                 to_currency: str = 'USD') -> Decimal:
-        """Convert amount between currencies with precision."""
+        """Convert amount between currencies with 100% Decimal precision."""
         if from_currency == to_currency:
-            return amount
+            return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
         cache_key = f"{from_currency}_{to_currency}"
 
@@ -106,7 +117,7 @@ class CurrencyConverter:
             if cache_key in self._cache:
                 rate = self._cache[cache_key]
             else:
-                # Calculate cross rate through USD
+                # Calculate cross rate using Decimal arithmetic ONLY
                 from_rate = self.EXCHANGE_RATES.get(from_currency)
                 to_rate = self.EXCHANGE_RATES.get(to_currency)
 
@@ -115,12 +126,13 @@ class CurrencyConverter:
                         f"Unsupported currency: {from_currency} or {to_currency}"
                     )
 
+                # Pure Decimal division - no float anywhere!
                 rate = to_rate / from_rate
                 self._cache[cache_key] = rate
 
-        # Convert and round to 2 decimal places
-        converted = float(amount) * rate
-        return Decimal(str(round(converted, 2)))
+        # 100% Decimal arithmetic throughout
+        converted = amount * rate
+        return converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 class OrderValidator:
@@ -139,16 +151,16 @@ class OrderValidator:
         """Validate a single order record. Returns list of validation errors."""
         errors = []
 
-        # Check required fields
+        # Check required fields - treat None, empty string, and whitespace-only as missing
         for field in cls.REQUIRED_FIELDS:
             value = order.get(field)
 
-            if value is None:
+            if value is None or str(value).strip() == '':
                 errors.append(f"Missing required field: {field}")
 
-        # Validate email format
+        # Validate email format (only if field is present)
         email = order.get('customer_email', '')
-        if email and not cls._validate_email(str(email)):
+        if email and str(email).strip() != '' and not cls._validate_email(str(email)):
             errors.append(f"Invalid email format: {email}")
 
         # Validate quantity
@@ -195,24 +207,55 @@ class OrderValidator:
 
     @classmethod
     def _parse_date(cls, date_str: str) -> datetime:
-        """Parse date from multiple formats."""
-        date_formats = [
+        """
+        Parse date from multiple formats.
+        For ambiguous MM/DD/YYYY vs DD/MM/YYYY:
+        - If first number > 12: must be DD/MM/YYYY
+        - Otherwise assume US format MM/DD/YYYY for American customers
+        """
+        date_str = date_str.strip()
+        
+        date_formats_iso = [
             '%Y-%m-%d',
             '%Y/%m/%d',
-            '%d/%m/%Y',
-            '%d-%m-%Y',
             '%Y-%m-%d %H:%M:%S',
             '%Y-%m-%dT%H:%M:%S',
             '%Y-%m-%dT%H:%M:%SZ',
         ]
-
-        for fmt in date_formats:
+        
+        for fmt in date_formats_iso:
             try:
-                return datetime.strptime(date_str.strip(), fmt)
+                return datetime.strptime(date_str, fmt)
             except ValueError:
                 continue
+        
+        import re
+        slash_match = re.match(r'^(\d{1,2})/(\d{1,2})/(\d{4})$', date_str)
+        dash_match = re.match(r'^(\d{1,2})-(\d{1,2})-(\d{4})$', date_str)
+        
+        if slash_match or dash_match:
+            match = slash_match or dash_match
+            part1, part2, year = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            
+            if part1 > 12:
+                return datetime(year, part2, part1)
+            elif part2 > 12:
+                return datetime(year, part1, part2)
+            else:
+                return datetime(year, part1, part2)
+        
+        dash_match_eu = re.match(r'^(\d{1,2})-(\d{1,2})-(\d{4})$', date_str)
+        if dash_match_eu:
+            part1, part2, year = int(dash_match_eu.group(1)), int(dash_match_eu.group(2)), int(dash_match_eu.group(3))
+            return datetime(year, part2, part1)
 
         raise ValueError(f"Unable to parse date: {date_str}")
+
+    @classmethod
+    def normalize_date(cls, date_str: str) -> str:
+        """Normalize date to ISO format YYYY-MM-DD for consistent output."""
+        dt = cls._parse_date(date_str)
+        return dt.strftime('%Y-%m-%d')
 
 
 class InventoryManager:
@@ -235,6 +278,19 @@ class InventoryManager:
                 self._inventory[product_id] = quantity
 
         logger.info(f"Loaded {len(self._inventory)} products from inventory")
+
+    def reserve_stock_atomic(self, product_id: str, quantity: int) -> Tuple[bool, int]:
+        """
+        Check and reserve stock in a single atomic operation.
+        Prevents race conditions that cause overselling.
+        Returns (success, available_quantity).
+        """
+        with self._lock:
+            available = self._inventory.get(product_id, 0)
+            if available >= quantity:
+                self._inventory[product_id] -= quantity
+                return True, available
+            return False, available
 
     def check_availability(self, product_id: str,
                           requested_quantity: int) -> Tuple[bool, int]:
@@ -356,7 +412,6 @@ class OrderProcessor:
             # Write processed orders
             with open(temp_output, 'w', newline='', encoding='utf-8') as out_f:
                 writer = None
-                # Define complete fieldnames upfront to handle dynamic fields
                 output_fieldnames = [
                     'order_id', 'customer_email', 'product_id', 'quantity',
                     'unit_price', 'total_amount', 'currency', 'original_currency',
@@ -367,7 +422,6 @@ class OrderProcessor:
                 for order in orders:
                     self.stats['total_orders'] += 1
 
-                    # Validate order
                     validation_errors = OrderValidator.validate_order(
                         order, self.stats['total_orders']
                     )
@@ -377,29 +431,23 @@ class OrderProcessor:
                         self.stats['errors'].extend(validation_errors)
                         continue
 
-                    # Check for duplicates
                     if self._is_duplicate(order):
                         self.stats['duplicates_merged'] += 1
                         continue
 
-                    # Convert currency
                     try:
                         order = self._convert_order_currency(
                             order, target_currency
                         )
                     except ValueError as e:
                         self.stats['warnings'].append(str(e))
-                        # Continue with original currency
 
-                    # Check inventory
                     if not self._check_inventory(order):
                         self.stats['inventory_failures'] += 1
                         continue
 
-                    # Mark order as seen
                     self._mark_order_seen(order)
 
-                    # Write to output
                     if writer is None:
                         writer = csv.DictWriter(out_f, fieldnames=output_fieldnames,
                                               extrasaction='ignore')
@@ -409,7 +457,6 @@ class OrderProcessor:
                     self.stats['valid_orders'] += 1
                     self._processed_orders.append(order)
 
-            # Move temp file to final output
             if os.path.exists(output_file):
                 os.remove(output_file)
             shutil.move(temp_output, output_file)
@@ -424,8 +471,12 @@ class OrderProcessor:
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             raise
-
-
+        finally:
+            if temp_output and os.path.exists(temp_output):
+                try:
+                    os.unlink(temp_output)
+                except OSError:
+                    pass
 
         return self.stats.copy()
 
@@ -484,11 +535,10 @@ class OrderProcessor:
 
     def _is_duplicate(self, order: Dict) -> bool:
         """
-        Detect duplicate orders based on order_id only.
-
-        Note: This assumes each order has only one product.
+        Detect duplicate orders based on order_id and product_id.
+        Same order can contain multiple products.
         """
-        order_key = order['order_id']
+        order_key = f"{order['order_id']}_{order['product_id']}"
 
         if order_key in self._seen_orders:
             return True
@@ -497,7 +547,7 @@ class OrderProcessor:
 
     def _mark_order_seen(self, order: Dict):
         """Mark an order as processed."""
-        order_key = order['order_id']
+        order_key = f"{order['order_id']}_{order['product_id']}"
         self._seen_orders[order_key] = {
             'timestamp': datetime.now().isoformat(),
             'quantity': int(order['quantity'])
@@ -505,19 +555,17 @@ class OrderProcessor:
 
     def _convert_order_currency(self, order: Dict,
                                 target_currency: str) -> Dict:
-        """Convert order prices to target currency."""
+        """Convert order prices to target currency and normalize date."""
         source_currency = order.get('currency', 'USD')
 
         if source_currency != target_currency:
             unit_price = Decimal(str(order['unit_price']))
             quantity = int(order['quantity'])
 
-            # Convert unit price
             converted_price = self.currency_converter.convert(
                 unit_price, source_currency, target_currency
             )
 
-            # Calculate total with precision
             total = (converted_price * quantity).quantize(
                 Decimal('0.01'), rounding=ROUND_HALF_UP
             )
@@ -529,7 +577,6 @@ class OrderProcessor:
             order['exchange_rate_applied'] = 'yes'
 
         else:
-            # Calculate total even if no conversion needed
             unit_price = Decimal(str(order['unit_price']))
             quantity = int(order['quantity'])
             total = (unit_price * quantity).quantize(
@@ -537,32 +584,29 @@ class OrderProcessor:
             )
             order['total_amount'] = str(total)
 
+        try:
+            order['order_date'] = OrderValidator.normalize_date(order['order_date'])
+        except (ValueError, KeyError):
+            pass
+
         return order
 
     def _check_inventory(self, order: Dict) -> bool:
-        """Check and reserve inventory for order."""
+        """Check and reserve inventory for order using atomic operation."""
         product_id = order['product_id']
         quantity = int(order['quantity'])
 
-
-
-        available, actual_qty = self.inventory.check_availability(
+        success, available = self.inventory.reserve_stock_atomic(
             product_id, quantity
         )
 
-        if not available:
+        if not success:
             error_msg = (
                 f"Insufficient inventory for {product_id}: "
-                f"requested {quantity}, available {actual_qty}"
+                f"requested {quantity}, available {available}"
             )
             self.stats['errors'].append(error_msg)
             logger.warning(error_msg)
-            return False
-
-        
-        if not self.inventory.reserve_stock(product_id, quantity):
-            error_msg = f"Failed to reserve stock for {product_id}"
-            self.stats['errors'].append(error_msg)
             return False
 
         order['inventory_reserved'] = 'yes'

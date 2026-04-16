@@ -1,0 +1,15 @@
+2026-04-16 18:06:07,646 - INFO - Loaded 10 products from inventory
+2026-04-16 18:06:07,646 - INFO - Processing file: sample/orders_sample.csv
+2026-04-16 18:06:07,646 - INFO - Detected encoding: utf-8
+2026-04-16 18:06:07,648 - WARNING - Insufficient inventory for PROD004: requested 3, available 0
+2026-04-16 18:06:07,650 - INFO - Processing complete: 8 valid, 6 invalid, 1 duplicates
+2026-04-16 18:35:51,238 - INFO - Loaded 10 products from inventory
+2026-04-16 18:35:51,238 - INFO - Processing file: sample/orders_sample.csv
+2026-04-16 18:35:51,239 - INFO - Detected encoding: utf-8
+2026-04-16 18:35:51,241 - WARNING - Insufficient inventory for PROD004: requested 3, available 0
+2026-04-16 18:35:51,242 - INFO - Processing complete: 8 valid, 6 invalid, 1 duplicates
+2026-04-16 18:36:26,422 - INFO - Loaded 10 products from inventory
+2026-04-16 18:36:26,422 - INFO - Processing file: sample/orders_sample.csv
+2026-04-16 18:36:26,423 - INFO - Detected encoding: utf-8
+2026-04-16 18:36:26,424 - WARNING - Insufficient inventory for PROD004: requested 3, available 0
+2026-04-16 18:36:26,425 - INFO - Processing complete: 8 valid, 6 invalid, 1 duplicates
