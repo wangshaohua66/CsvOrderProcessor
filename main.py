@@ -115,12 +115,12 @@ class CurrencyConverter:
                         f"Unsupported currency: {from_currency} or {to_currency}"
                     )
 
-                rate = to_rate / from_rate
+                rate = Decimal(str(to_rate)) / Decimal(str(from_rate))
                 self._cache[cache_key] = rate
 
-        # Convert and round to 2 decimal places
-        converted = float(amount) * rate
-        return Decimal(str(round(converted, 2)))
+        # Convert using Decimal to maintain precision
+        converted = amount * rate
+        return converted.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 class OrderValidator:
@@ -143,7 +143,7 @@ class OrderValidator:
         for field in cls.REQUIRED_FIELDS:
             value = order.get(field)
 
-            if value is None:
+            if value is None or (isinstance(value, str) and value.strip() == ''):
                 errors.append(f"Missing required field: {field}")
 
         # Validate email format
@@ -195,20 +195,61 @@ class OrderValidator:
 
     @classmethod
     def _parse_date(cls, date_str: str) -> datetime:
-        """Parse date from multiple formats."""
-        date_formats = [
+        """Parse date from multiple formats with region detection."""
+        date_str = date_str.strip()
+
+        # ISO 8601 formats (unambiguous, try first)
+        iso_formats = [
             '%Y-%m-%d',
             '%Y/%m/%d',
-            '%d/%m/%Y',
-            '%d-%m-%Y',
             '%Y-%m-%d %H:%M:%S',
             '%Y-%m-%dT%H:%M:%S',
             '%Y-%m-%dT%H:%M:%SZ',
         ]
 
-        for fmt in date_formats:
+        for fmt in iso_formats:
             try:
-                return datetime.strptime(date_str.strip(), fmt)
+                return datetime.strptime(date_str, fmt)
+            except ValueError:
+                continue
+
+        # Ambiguous formats - try to detect based on values
+        # If day > 12, it must be day-first (European format)
+        # If month > 12, it must be month-first (US format)
+        for sep in ['/', '-']:
+            if sep in date_str:
+                parts = date_str.split(sep)
+                if len(parts) == 3:
+                    try:
+                        first = int(parts[0])
+                        second = int(parts[1])
+
+                        # If first number > 12, it's day-first (European)
+                        if first > 12:
+                            try:
+                                return datetime.strptime(date_str, f'%d{sep}%m{sep}%Y')
+                            except ValueError:
+                                pass
+                        # If second number > 12, it's month-first (US)
+                        elif second > 12:
+                            try:
+                                return datetime.strptime(date_str, f'%m{sep}%d{sep}%Y')
+                            except ValueError:
+                                pass
+                    except ValueError:
+                        pass
+
+        # Fallback: try standard formats with preference for ISO (year-first)
+        fallback_formats = [
+            '%d/%m/%Y',
+            '%d-%m-%Y',
+            '%m/%d/%Y',
+            '%m-%d-%Y',
+        ]
+
+        for fmt in fallback_formats:
+            try:
+                return datetime.strptime(date_str, fmt)
             except ValueError:
                 continue
 
@@ -235,6 +276,24 @@ class InventoryManager:
                 self._inventory[product_id] = quantity
 
         logger.info(f"Loaded {len(self._inventory)} products from inventory")
+
+    def check_and_reserve(self, product_id: str,
+                          requested_quantity: int) -> Tuple[bool, int]:
+        """
+        Atomically check availability and reserve stock.
+        Returns (success, actual_reserved_quantity).
+        """
+        with self._lock:
+            available = self._inventory.get(product_id, 0)
+            if available >= requested_quantity:
+                self._inventory[product_id] -= requested_quantity
+                return True, requested_quantity
+            elif available > 0:
+                # Partial fulfillment - reserve what is available
+                self._inventory[product_id] = 0
+                return False, available
+            else:
+                return False, 0
 
     def check_availability(self, product_id: str,
                           requested_quantity: int) -> Tuple[bool, int]:
@@ -424,6 +483,14 @@ class OrderProcessor:
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             raise
+        finally:
+            # Ensure temporary file is always cleaned up
+            if temp_output and os.path.exists(temp_output):
+                try:
+                    os.remove(temp_output)
+                    logger.info(f"Cleaned up temporary file: {temp_output}")
+                except OSError as cleanup_error:
+                    logger.warning(f"Failed to clean up temporary file {temp_output}: {cleanup_error}")
 
 
 
@@ -484,11 +551,12 @@ class OrderProcessor:
 
     def _is_duplicate(self, order: Dict) -> bool:
         """
-        Detect duplicate orders based on order_id only.
+        Detect duplicate orders based on order_id and product_id.
 
-        Note: This assumes each order has only one product.
+        An order is a duplicate only if both order_id and product_id match.
+        This allows the same order to have multiple different products.
         """
-        order_key = order['order_id']
+        order_key = (order['order_id'], order['product_id'])
 
         if order_key in self._seen_orders:
             return True
@@ -497,7 +565,7 @@ class OrderProcessor:
 
     def _mark_order_seen(self, order: Dict):
         """Mark an order as processed."""
-        order_key = order['order_id']
+        order_key = (order['order_id'], order['product_id'])
         self._seen_orders[order_key] = {
             'timestamp': datetime.now().isoformat(),
             'quantity': int(order['quantity'])
@@ -512,14 +580,17 @@ class OrderProcessor:
             unit_price = Decimal(str(order['unit_price']))
             quantity = int(order['quantity'])
 
-            # Convert unit price
-            converted_price = self.currency_converter.convert(
-                unit_price, source_currency, target_currency
+            # Calculate total in source currency first (higher precision)
+            total_source = unit_price * quantity
+
+            # Convert total amount to target currency (single conversion for accuracy)
+            total = self.currency_converter.convert(
+                total_source, source_currency, target_currency
             )
 
-            # Calculate total with precision
-            total = (converted_price * quantity).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
+            # Convert unit price for display (may have rounding)
+            converted_price = self.currency_converter.convert(
+                unit_price, source_currency, target_currency
             )
 
             order['unit_price'] = str(converted_price)
@@ -540,29 +611,22 @@ class OrderProcessor:
         return order
 
     def _check_inventory(self, order: Dict) -> bool:
-        """Check and reserve inventory for order."""
+        """Check and reserve inventory for order atomically."""
         product_id = order['product_id']
         quantity = int(order['quantity'])
 
-
-
-        available, actual_qty = self.inventory.check_availability(
+        # Use atomic check_and_reserve to prevent race conditions
+        success, actual_qty = self.inventory.check_and_reserve(
             product_id, quantity
         )
 
-        if not available:
+        if not success:
             error_msg = (
                 f"Insufficient inventory for {product_id}: "
                 f"requested {quantity}, available {actual_qty}"
             )
             self.stats['errors'].append(error_msg)
             logger.warning(error_msg)
-            return False
-
-        
-        if not self.inventory.reserve_stock(product_id, quantity):
-            error_msg = f"Failed to reserve stock for {product_id}"
-            self.stats['errors'].append(error_msg)
             return False
 
         order['inventory_reserved'] = 'yes'
