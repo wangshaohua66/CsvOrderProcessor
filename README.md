@@ -629,6 +629,3 @@ reserve_stock(product_id: str, quantity: int) -> bool
 3. 阅读 `bugs/` 目录了解已知问题和修复方案
 
 ---
-
-**最后更新**: 2026-04-16  
-**维护者**: AI Benchmark Suite Team
