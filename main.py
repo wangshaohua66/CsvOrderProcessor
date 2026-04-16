@@ -115,12 +115,12 @@ class CurrencyConverter:
                         f"Unsupported currency: {from_currency} or {to_currency}"
                     )
 
-                rate = to_rate / from_rate
+                rate = Decimal(str(to_rate / from_rate))
                 self._cache[cache_key] = rate
 
-        # Convert and round to 2 decimal places
-        converted = float(amount) * rate
-        return Decimal(str(round(converted, 2)))
+        # Convert using Decimal for precision
+        converted = (amount * rate).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return converted
 
 
 class OrderValidator:
@@ -143,7 +143,7 @@ class OrderValidator:
         for field in cls.REQUIRED_FIELDS:
             value = order.get(field)
 
-            if value is None:
+            if value is None or (isinstance(value, str) and value.strip() == ''):
                 errors.append(f"Missing required field: {field}")
 
         # Validate email format
@@ -195,15 +195,15 @@ class OrderValidator:
 
     @classmethod
     def _parse_date(cls, date_str: str) -> datetime:
-        """Parse date from multiple formats."""
+        """Parse date from multiple formats with unambiguous ordering."""
         date_formats = [
             '%Y-%m-%d',
-            '%Y/%m/%d',
-            '%d/%m/%Y',
-            '%d-%m-%Y',
             '%Y-%m-%d %H:%M:%S',
             '%Y-%m-%dT%H:%M:%S',
             '%Y-%m-%dT%H:%M:%SZ',
+            '%Y/%m/%d',
+            '%d-%m-%Y',
+            '%d/%m/%Y',
         ]
 
         for fmt in date_formats:
@@ -256,6 +256,20 @@ class InventoryManager:
                 self._inventory[product_id] -= quantity
                 return True
             return False
+
+    def check_and_reserve_stock(self, product_id: str, quantity: int) -> Tuple[bool, int]:
+        """
+        Atomically check and reserve stock for an order.
+        Returns (success, available_quantity).
+        This prevents TOCTOU race conditions.
+        """
+        with self._lock:
+            available = self._inventory.get(product_id, 0)
+            if available >= quantity:
+                self._inventory[product_id] -= quantity
+                return True, quantity
+            else:
+                return False, available
 
     def get_stock_level(self, product_id: str) -> int:
         """Get current stock level for a product."""
@@ -424,6 +438,13 @@ class OrderProcessor:
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             raise
+        finally:
+            if temp_output and os.path.exists(temp_output):
+                try:
+                    os.remove(temp_output)
+                    logger.debug(f"Cleaned up temporary file: {temp_output}")
+                except OSError as cleanup_error:
+                    logger.warning(f"Failed to cleanup temp file: {cleanup_error}")
 
 
 
@@ -484,11 +505,11 @@ class OrderProcessor:
 
     def _is_duplicate(self, order: Dict) -> bool:
         """
-        Detect duplicate orders based on order_id only.
+        Detect duplicate orders based on order_id and product_id combination.
 
-        Note: This assumes each order has only one product.
+        This handles orders with multiple products correctly.
         """
-        order_key = order['order_id']
+        order_key = f"{order['order_id']}_{order['product_id']}"
 
         if order_key in self._seen_orders:
             return True
@@ -540,29 +561,21 @@ class OrderProcessor:
         return order
 
     def _check_inventory(self, order: Dict) -> bool:
-        """Check and reserve inventory for order."""
+        """Check and reserve inventory for order atomically."""
         product_id = order['product_id']
         quantity = int(order['quantity'])
 
-
-
-        available, actual_qty = self.inventory.check_availability(
+        success, available_qty = self.inventory.check_and_reserve_stock(
             product_id, quantity
         )
 
-        if not available:
+        if not success:
             error_msg = (
                 f"Insufficient inventory for {product_id}: "
-                f"requested {quantity}, available {actual_qty}"
+                f"requested {quantity}, available {available_qty}"
             )
             self.stats['errors'].append(error_msg)
             logger.warning(error_msg)
-            return False
-
-        
-        if not self.inventory.reserve_stock(product_id, quantity):
-            error_msg = f"Failed to reserve stock for {product_id}"
-            self.stats['errors'].append(error_msg)
             return False
 
         order['inventory_reserved'] = 'yes'
